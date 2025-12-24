@@ -1,0 +1,181 @@
+resource "azurerm_resource_group" "resourceGroups" {
+  location = "eastus"
+  name     = "rg-eus.pdfgenerator.dev"
+  tags     = var.rgtags
+}
+
+################### Network Configuration ###################
+resource "azurerm_virtual_network" "vnet-containerapp" {
+  name                = "vnet-eus.pdfgenerator.dev"
+  location            = azurerm_resource_group.resourceGroups.location
+  resource_group_name = azurerm_resource_group.resourceGroups.name
+  tags                = var.containerapptags
+  address_space       = var.vnet_address_space
+  depends_on = [
+    azurerm_resource_group.resourceGroups,
+  ]
+}
+
+resource "azurerm_subnet" "snet-containerapp" {
+  name                 = "snet-eus.pdfgenerator.dev"
+  resource_group_name  = azurerm_resource_group.resourceGroups.name
+  virtual_network_name = azurerm_virtual_network.vnet-containerapp.name
+  address_prefixes     = var.subnet_address_prefixes
+  delegation {
+    name = "containerapp-delegation"
+    service_delegation {
+      name    = "Microsoft.App/environments"
+      actions = ["Microsoft.Network/virtualNetworks/subnets/join/action"]
+    }
+  }
+  depends_on = [
+    azurerm_resource_group.resourceGroups,
+    azurerm_virtual_network.vnet-containerapp,
+  ]
+}
+
+
+resource "azurerm_route_table" "containerapp_RT" {
+  name                = "var.route_table_name"
+  location            = azurerm_resource_group.resourceGroups.location
+  resource_group_name = azurerm_resource_group.resourceGroups.name
+  tags = var.containerapptags
+  route {
+    name                   = "DefaultRoute"
+    address_prefix         = "0.0.0.0/0"
+    next_hop_type          = "VirtualAppliance"
+    next_hop_in_ip_address = "var.firewall_private_ip"
+  }
+  depends_on = [
+    azurerm_subnet.snet-containerapp,
+    azurerm_resource_group.resourceGroups,
+  ]
+}
+
+resource "azurerm_subnet_route_table_association" "containerapp_RT_to_snet" {
+  route_table_id = azurerm_route_table.containerapp_RT.id
+  subnet_id      = "${azurerm_subnet.snet-containerapp.id}"
+  depends_on = [
+    azurerm_subnet.snet-containerapp,
+    azurerm_route_table.containerapp_RT,
+  ]
+}
+
+resource "azurerm_virtual_network_peering" "Spoke_to_Hub" {
+  name                         = "var.vnet_peering_name"
+  resource_group_name          = azurerm_resource_group.resourceGroups.name
+  virtual_network_name         = azurerm_virtual_network.vnet-containerapp.name
+  remote_virtual_network_id    = "var.hub_vnet_id"
+  allow_virtual_network_access = true
+  allow_forwarded_traffic      = true
+  allow_gateway_transit        = true
+  depends_on = [
+    azurerm_virtual_network.vnet-containerapp,
+    azurerm_resource_group.resourceGroups,
+  ]
+}
+
+resource "azurerm_virtual_network_peering" "Hub_to_Spoke" {
+  name                         = "var.vnet_peering_name"
+  resource_group_name          = "azurerm_resource_group.resourceGroups.name"
+  virtual_network_name         = "azurerm_virtual_network.vnet-containerapp.name"
+  remote_virtual_network_id    = azurerm_virtual_network.vnet-containerapp.id
+  allow_virtual_network_access = true
+  allow_forwarded_traffic      = true
+  provider                     = azurerm.Networking
+  depends_on = [
+    azurerm_virtual_network.vnet-containerapp,
+    azurerm_resource_group.resourceGroups,
+  ]
+}
+
+
+################### Log Analytics Workspace ###################
+
+resource "azurerm_log_analytics_workspace" "logworkspace" {
+  location            = azurerm_resource_group.resourceGroups.location
+  name                = "var.log_analytics"
+  resource_group_name = azurerm_resource_group.resourceGroups.name
+  tags                = var.containerapptags
+  depends_on = [
+    azurerm_resource_group.resourceGroups,
+  ]
+}
+
+################### Azure Container Apps Environment ###################
+
+resource "azurerm_container_app_environment" "containerappenv1" {
+  location                       = azurerm_resource_group.resourceGroups.location
+  name                           = "var.container_app"
+  resource_group_name            = azurerm_resource_group.resourceGroups.name
+  log_analytics_workspace_id     = azurerm_log_analytics_workspace.logworkspace.id
+  infrastructure_subnet_id       = azurerm_subnet.snet-containerapp.id
+  tags = var.containerapptags
+  workload_profile {
+    name = "Consumption"
+    workload_profile_type = "Consumption"
+  }
+  internal_load_balancer_enabled = true
+  depends_on = [
+    azurerm_resource_group.resourceGroups,
+    azurerm_subnet.snet-containerapp,
+  ]
+}
+
+################### Azure Container Apps - PDF-Generator App ###################
+
+resource "azurerm_container_app" "pdfgenerator-dev" {
+  name                         = "pdfgeneratordev"
+  container_app_environment_id = azurerm_container_app_environment.containerappenv1.id
+  resource_group_name          = azurerm_resource_group.resourceGroups.name
+  revision_mode                = "Single"
+  tags                         = var.containerapptags
+  workload_profile_name        = "Consumption"
+  ingress {
+    allow_insecure_connections = true
+    external_enabled           = true
+    target_port                = 3000    
+    custom_domain {
+      name = "pdfgenerator-dev.abc.com"
+      certificate_id = azurerm_container_app_environment_certificate.abc.id
+      certificate_binding_type = "SniEnabled"
+    }
+    traffic_weight {
+      latest_revision = true
+      percentage      = 100
+    }
+  }
+  registry {
+    password_secret_name = "reg-pswd"
+    server               = data.azurerm_key_vault_secret.jforgserver.value
+    username             = data.azurerm_key_vault_secret.jforguser.value
+  }
+  secret {
+    name  = "reg-pswd"
+    value = data.azurerm_key_vault_secret.jforgpass.value
+  }
+  template {
+    container {
+      cpu    = 0.5
+      image = data.azurerm_key_vault_secret.pdfgeneratorImage.value
+      memory = "1Gi"
+      name   = "pdfdevlatest"
+    }
+    
+  }
+  depends_on = [
+    azurerm_container_app_environment.containerappenv1,
+    azurerm_container_app_environment_certificate.abc,
+  ]
+}
+
+resource "azurerm_container_app_environment_certificate" "abcSSL2026" {
+  certificate_blob_base64      = filebase64("/sslcertificate/abc_2025.pfx")
+  certificate_password         = data.azurerm_key_vault_secret.sslpassword.value
+  container_app_environment_id = azurerm_container_app_environment.containerappenv1.id
+  name                         = "ssl2026"
+  tags                         = var.containerapptags
+  depends_on = [
+    azurerm_container_app_environment.containerappenv1,
+  ]
+}
